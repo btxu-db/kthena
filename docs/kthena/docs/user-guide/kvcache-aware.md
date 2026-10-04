@@ -26,7 +26,7 @@ Pods with more consecutive matching blocks score higher and are preferred for ro
 Because the router may run with multiple replicas, each router instance **actively registers itself** with every runtime sidecar:
 
 1. Each router replica periodically (default every 30s) calls `POST /kvcache/routers/register` on every known model-serving pod's runtime sidecar, sending its own push endpoint (`http://<router-pod-ip>:<kvEventsPort>`) and a TTL (default 90s). Registration doubles as a heartbeat — sidecars drop routers that stop renewing.
-2. When a sidecar sees a **new** registration (or a renewal after expiry), it pushes a full **snapshot** of its current KV block index to that router, so a freshly started or restarted router immediately has complete state.
+2. When a sidecar sees a **new** registration (or a renewal after expiry), it pushes a full **snapshot** of its current KV block index to that router, so a freshly started or restarted router immediately has complete state. Large indexes are split into several requests per model: the first one replaces the router's view of that model and the rest append to it.
 3. From then on, every KV cache event (`stored` / `removed` / `cleared`) is converted to standardized block hashes and pushed to **all registered router instances** via `POST <router-endpoint>/kvcache/events`.
 4. At request time the plugin answers block-ownership lookups from its local in-memory index — no Redis query, no network latency on the scoring path.
 

@@ -38,6 +38,14 @@ PUSH_TIMEOUT_SECONDS = 2.0
 # is marked dirty so its next registration heartbeat receives a full snapshot.
 ENDPOINT_QUEUE_MAXSIZE = 1024
 
+# Upper bound of blocks carried by one snapshot request. The router caps KV
+# event request bodies at 4 MiB (kvEventsMaxBodyBytes in
+# pkg/kthena-router/scheduler/plugins/kvcache_memory_index.go), and each block
+# encodes to at most ~33 bytes of JSON (a 63-bit hash and a 10-digit timestamp
+# plus separators), so a full snapshot of a large KV cache has to be split.
+# 50000 blocks stay under ~1.6 MiB, well below the cap.
+SNAPSHOT_BATCH_SIZE = 50000
+
 # Queue item kinds processed by the per-endpoint delivery worker.
 _ITEM_DELTA = "delta"
 _ITEM_SNAPSHOT = "snapshot"
@@ -233,6 +241,11 @@ class MemoryKVCacheManager:
         reflects every mutation whose delta precedes it and cannot be
         overtaken by a newer delta it does not contain. Pending deltas are
         discarded first: the snapshot supersedes them.
+
+        Each model is sent in batches of at most SNAPSHOT_BATCH_SIZE blocks to
+        stay under the router's request body limit: the first batch is a
+        snapshot event replacing the router's view of that model, the rest
+        are stored events appending to it.
         """
         queue = self._ensure_worker(endpoint)
         self._drain_queue(queue)
@@ -318,16 +331,27 @@ class MemoryKVCacheManager:
 
     async def _send_snapshot(self, endpoint: str, pod_identifier: str) -> None:
         ok = True
-        for model_name, model_blocks in self._blocks.items():
+        # Copy before awaiting: events handled while a batch is in flight may
+        # add models or blocks, and their deltas are queued behind this item.
+        for model_name, model_blocks in list(self._blocks.items()):
             # Preserve original per-block store times; re-stamping them at
             # snapshot time would defeat the engine-restart freshness filter.
-            hashes = list(model_blocks.keys())
-            if not await self._send(endpoint, pod_identifier, model_name, [{
-                "type": KV_EVENT_SNAPSHOT,
-                "block_hashes": hashes,
-                "timestamps": [model_blocks[h] for h in hashes],
-            }]):
-                ok = False
+            items = list(model_blocks.items())
+            # The first batch replaces what the router knows about this model
+            # and the rest append to it. An empty model still sends one empty
+            # snapshot so the router drops its stale entries.
+            for start in range(0, max(len(items), 1), SNAPSHOT_BATCH_SIZE):
+                batch = items[start:start + SNAPSHOT_BATCH_SIZE]
+                if not await self._send(endpoint, pod_identifier, model_name, [{
+                    "type": KV_EVENT_SNAPSHOT if start == 0 else KV_EVENT_STORED,
+                    "block_hashes": [h for h, _ in batch],
+                    "timestamps": [ts for _, ts in batch],
+                }]):
+                    # The endpoint is dirty now, so the next heartbeat restarts
+                    # this model from a snapshot; the remaining batches would
+                    # only be wasted.
+                    ok = False
+                    break
         if ok:
             self._dirty_endpoints.discard(endpoint)
             logger.info(f"Pushed KV snapshot to router endpoint {endpoint}")

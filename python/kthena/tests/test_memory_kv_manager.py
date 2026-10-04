@@ -212,6 +212,81 @@ async def test_push_snapshot_represents_cleared_model_as_empty():
 
 
 @pytest.mark.asyncio
+async def test_push_snapshot_splits_large_index_into_batches(monkeypatch):
+    """A snapshot larger than one batch is sent as a snapshot event replacing
+    the router's view followed by stored events appending to it."""
+    monkeypatch.setattr(
+        "kthena.runtime.memory_kv_manager.SNAPSHOT_BATCH_SIZE", 2)
+    manager, client = _make_manager(["http://router-a:9080"])
+    await manager.add_blocks(
+        "qwen", [101, 102, 103, 104, 105], "pod-1.default", list(range(80)))
+    await manager.flush()
+    client.post.reset_mock()
+
+    await manager.push_snapshot("http://router-new:9080", "pod-1.default")
+
+    payloads = _pushed_payloads(client)
+    events = [payload["events"][0] for _, payload in payloads]
+    assert [event["type"] for event in events] == [
+        KV_EVENT_SNAPSHOT, KV_EVENT_STORED, KV_EVENT_STORED]
+    assert [len(event["block_hashes"]) for event in events] == [2, 2, 1]
+    stored = manager._blocks["qwen"]
+    sent = [h for event in events for h in event["block_hashes"]]
+    assert sorted(sent) == sorted(stored)
+    for event in events:
+        assert event["timestamps"] == [stored[h] for h in event["block_hashes"]]
+    assert not manager.is_dirty("http://router-new:9080")
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_push_snapshot_starts_each_model_with_snapshot_event(monkeypatch):
+    monkeypatch.setattr(
+        "kthena.runtime.memory_kv_manager.SNAPSHOT_BATCH_SIZE", 1)
+    manager, client = _make_manager(["http://router-a:9080"])
+    await manager.add_blocks("qwen", [101, 102], "pod-1.default", list(range(32)))
+    await manager.add_blocks("llama", [201, 202], "pod-1.default", list(range(32, 64)))
+    await manager.flush()
+    client.post.reset_mock()
+
+    await manager.push_snapshot("http://router-new:9080", "pod-1.default")
+
+    types_by_model = {}
+    for _, payload in _pushed_payloads(client):
+        types_by_model.setdefault(payload["model_name"], []).append(
+            payload["events"][0]["type"])
+    assert types_by_model == {
+        "qwen": [KV_EVENT_SNAPSHOT, KV_EVENT_STORED],
+        "llama": [KV_EVENT_SNAPSHOT, KV_EVENT_STORED],
+    }
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_snapshot_batch_stops_model_and_marks_dirty(monkeypatch):
+    monkeypatch.setattr(
+        "kthena.runtime.memory_kv_manager.SNAPSHOT_BATCH_SIZE", 1)
+    manager, client = _make_manager(["http://router-a:9080"])
+    await manager.add_blocks(
+        "qwen", [101, 102, 103], "pod-1.default", list(range(48)))
+    await manager.flush()
+    client.post.reset_mock()
+
+    ok_response = MagicMock()
+    ok_response.raise_for_status = MagicMock()
+    client.post.side_effect = [ok_response, RuntimeError("connection reset")]
+
+    await manager.push_snapshot("http://router-new:9080", "pod-1.default")
+
+    # The third batch is not sent: the next heartbeat restarts from a snapshot.
+    events = [payload["events"][0] for _, payload in _pushed_payloads(client)]
+    assert [event["type"] for event in events] == [
+        KV_EVENT_SNAPSHOT, KV_EVENT_STORED]
+    assert manager.is_dirty("http://router-new:9080")
+    await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_push_marks_endpoint_dirty_until_snapshot_succeeds():
     manager, client = _make_manager(["http://router-a:9080"])
     client.post.side_effect = RuntimeError("connection refused")
